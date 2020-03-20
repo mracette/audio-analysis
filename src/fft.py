@@ -1,30 +1,26 @@
-"""
-ffmpeg command:
-ffmpeg -r 30 -f image2 -s 630x474 -i ./frames/%03d.png -i ./audio/hard_times.mp3 -vcodec libx264 -pix_fmt yuv420p -frames 150 test.mp4
-
-"""
-
 import os
 import subprocess
+import json
 
 import librosa
 import librosa.display
 import numpy as np
-import matplotlib.pyplot as plt
 
 from utils import chars
 
 DIRNAME = os.path.dirname(__file__)
+SONG_NAME = 'hard_times'
 PATH_TO_AUDIO = os.path.join(DIRNAME, '../audio/hard_times.mp3')
-PATH_TO_FRAMES = os.path.join(DIRNAME, '../frames')
-PATH_TO_RENDERS = os.path.join(DIRNAME, '../renders')
+PATH_TO_FRAMES = os.path.join(DIRNAME, '../frames', SONG_NAME + '/')
+PATH_TO_RENDERS = os.path.join(DIRNAME, '../renders', SONG_NAME + '/')
+PATH_TO_DATA_OUT = os.path.join(DIRNAME, '../data/', SONG_NAME + '/')
 
-DURATION = 5.0
-SR_MONO = 44100
+DURATION = 30.0
+SAMPLE_RATE = 44100
 FPS = 30
 POWER = 11
 FFT_SIZE = pow(2, POWER)
-HOP_LENGTH = round(SR_MONO / FPS)  # todo: better way to make this an int?
+HOP_LENGTH = round(SAMPLE_RATE / FPS)  # todo: better way to make this an int?
 ZERO_PADDING = '%06d'
 
 """
@@ -45,63 +41,100 @@ def applySmoothing(D, amount=.85):
             D[i][j] = D[i][j] * (1 - amount) + prev * amount
 
 
-def renderVideo(output_name, width, height, n_frames, fps):
-    args = ['ffmpeg']
-    args.append('-y')
-    args.extend(['-framerate', str(fps)])
-    args.extend(['-s', f'{width}x{height}'])
-    args.extend(['-i', os.path.join(PATH_TO_FRAMES, ZERO_PADDING + '.png')])
-    args.extend(['-i', PATH_TO_AUDIO])
-    args.extend(['-vcodec', 'libx264'])
-    args.extend(['-pix_fmt', 'yuv420p'])
-    # if n_frames:
-    #     args.extend(['-frames:v', str(n_frames)])
-    args.append('-shortest')
-    args.append(os.path.join(PATH_TO_RENDERS, output_name + '.mp4'))
-    print(chars.info + 'Rendering video...')
-    subprocess.Popen(args)
-    print(chars.success + f'Video rendered to {PATH_TO_RENDERS}')
+def exportFrame(i, f, y):
+    filename = (ZERO_PADDING % i) + '.png'
+    print(f'Exporting frame {filename}')
+    plt.clf()
+    plt.plot(f, y)
+    plt.tight_layout()
+    plt.xscale('log')
+    plt.savefig(os.path.join(PATH_TO_FRAMES, filename),
+                bbox_inches='tight')
 
 
-def exportFrames(D, frequencies):
-    for i, f in enumerate(D):
-        filename = (ZERO_PADDING % i) + '.png'
-        print(f'Exporting frame {filename}')
-        plt.clf()
-        plt.plot(frequencies, f)
-        plt.tight_layout()
-        plt.xscale('log')
-        plt.savefig(os.path.join(PATH_TO_FRAMES, filename),
-                    bbox_inches='tight')
+def processFrames(data, frequencies, parallelism=None):
+    if parallelism:
+        p = Pool(parallelism)
+        p.starmap(exportFrame, [(index, frequencies, frame)
+                                for index, frame in enumerate(data)])
+    else:
+        for index, frame in enumerate(data):
+            exportFrame(index, frame, frequencies)
 
 
-def processFft():
+def writeOut(data):
+    for k, v in data.items():
+        with open(os.path.join(PATH_TO_DATA_OUT, k + '.json'), 'w') as out_file:
+            out_file.write(json.dumps(v.tolist()))
+
+
+def processAudio(f_method='fft', b_method='times'):
+
+    # Get raw PCM data
     y, sr = librosa.load(
         PATH_TO_AUDIO,
         duration=DURATION,
-        sr=SR_MONO,
+        sr=SAMPLE_RATE,
         mono=True
     )
-    print(y)
-    fft = librosa.stft(
-        y,
-        n_fft=FFT_SIZE,
-        hop_length=HOP_LENGTH,
-        center=True
-    )
-    frequencies = librosa.fft_frequencies(sr=SR_MONO, n_fft=FFT_SIZE)
-    matrix = np.transpose(librosa.amplitude_to_db(np.abs(fft), ref=np.max))
+
+    # Separate harmonics and percussives into two waveforms
+    y_harmonic, y_percussive = librosa.effects.hpss(y)
+
+    # Beat track on the percussive signal
+    tempo, beat_frames = librosa.beat.beat_track(y=y_percussive,
+                                                 sr=SAMPLE_RATE)
+
+    if b_method == 'times':
+        B = librosa.frames_to_time(beat_frames, sr=SAMPLE_RATE)
+    else:
+        B = beat_frames
+
+    if f_method == 'fft':
+        D = librosa.stft(
+            y,
+            n_fft=FFT_SIZE,
+            hop_length=HOP_LENGTH,
+            center=True
+        )
+        F = librosa.fft_frequencies(sr=SAMPLE_RATE, n_fft=FFT_SIZE)
+
+    elif f_method == 'cqt':
+        D = librosa.cqt(
+            y,
+            sr=SAMPLE_RATE,
+            hop_length=HOP_LENGTH,
+            n_bins=84,
+            bins_per_octave=12,
+            fmin=28
+        )
+        F = librosa.cqt_frequencies(84, 28, 12)
+
+    D = np.transpose(librosa.amplitude_to_db(np.abs(D), ref=np.max))
+
     return {
-        "d": matrix,
-        "f": frequencies
+        "d": D,
+        "f": F,
+        "b": B,
     }
 
 
+def checkPaths(path_array):
+    for path in path_array:
+        if not os.path.exists(path):
+            os.makedirs(path)
+
+
 def main():
-    # fft = processFft()
-    # applySmoothing(fft["d"], .85)
-    # exportFrames(fft["d"], fft["f"])
-    renderVideo('test_smoothing', 630, 474, FPS * DURATION, FPS)
+
+    checkPaths([PATH_TO_AUDIO, PATH_TO_DATA_OUT,
+                PATH_TO_FRAMES, PATH_TO_RENDERS])
+    audio_objects = processAudio(f_method='fft', b_method='times')
+    applySmoothing(audio_objects["d"], .85)
+    writeOut(audio_objects)
+
+    # processFrames(audio_objects["d"], audio_objects["f"])
+    # renderVideo('test_cqt', 630, 474, FPS * DURATION, FPS)
 
 
 if __name__ == '__main__':
